@@ -6,6 +6,9 @@
 
 #include <iostream>
 #include <vector>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
 
 #include "cuda_runtime.h"
 #include "cuda.h"
@@ -51,8 +54,12 @@ bool gStartSet;
 EcPoint gPubKey;
 u8 gGPUs_Mask[MAX_GPU_CNT];
 char gTamesFileName[1024];
+// NEW: multi-key file support
+char gPubKeysFileName[1024];
+bool gUsePubKeysFile;
+
 double gMax;
-bool gGenMode; //tames generation mode
+bool gGenMode; // tames generation mode
 bool gIsOpsLimit;
 
 #pragma pack(push, 1)
@@ -75,8 +82,6 @@ void InitGpus()
 //	gcnt = 1; //dbg
 	if (!gcnt)
 		return;
-    char gPubKeysFileName[1024];
-    bool gUsePubKeysFile = false;
 
 	int drv, rt;
 	cudaRuntimeGetVersion(&rt);
@@ -525,8 +530,7 @@ bool ParseCommandLine(int argc, char* argv[])
 				gGPUs_Mask[gpus[i] - '0'] = 1;
 			}
 		}
-		else
-		if (strcmp(argument, "-dp") == 0)
+		else if (strcmp(argument, "-dp") == 0)
 		{
 			int val = atoi(argv[ci]);
 			ci++;
@@ -537,8 +541,7 @@ bool ParseCommandLine(int argc, char* argv[])
 			}
 			gDP = val;
 		}
-		else
-		if (strcmp(argument, "-range") == 0)
+		else if (strcmp(argument, "-range") == 0)
 		{
 			int val = atoi(argv[ci]);
 			ci++;
@@ -549,8 +552,7 @@ bool ParseCommandLine(int argc, char* argv[])
 			}
 			gRange = val;
 		}
-		else
-		if (strcmp(argument, "-start") == 0)
+		else if (strcmp(argument, "-start") == 0)
 		{	
 			if (!gStart.SetHexStr(argv[ci]))
 			{
@@ -560,8 +562,7 @@ bool ParseCommandLine(int argc, char* argv[])
 			ci++;
 			gStartSet = true;
 		}
-		else
-		if (strcmp(argument, "-pubkey") == 0)
+		else if (strcmp(argument, "-pubkey") == 0)
 		{
 			if (!gPubKey.SetHexStr(argv[ci]))
 			{
@@ -570,22 +571,18 @@ bool ParseCommandLine(int argc, char* argv[])
 			}
 			ci++;
 		}
-			else
-if (strcmp(argument, "-pubkeysfile") == 0)
-{
-    strcpy(gPubKeysFileName, argv[ci]);
-    ci++;
-    gUsePubKeysFile = true;
-}
-
-		else
-		if (strcmp(argument, "-tames") == 0)
+		else if (strcmp(argument, "-pubkeysfile") == 0)
+		{
+			strcpy(gPubKeysFileName, argv[ci]);
+			ci++;
+			gUsePubKeysFile = true;
+		}
+		else if (strcmp(argument, "-tames") == 0)
 		{
 			strcpy(gTamesFileName, argv[ci]);
 			ci++;
 		}
-		else
-		if (strcmp(argument, "-max") == 0)
+		else if (strcmp(argument, "-max") == 0)
 		{
 			double val = atof(argv[ci]);
 			ci++;
@@ -602,12 +599,30 @@ if (strcmp(argument, "-pubkeysfile") == 0)
 			return false;
 		}
 	}
-	if (!gPubKey.x.IsZero())
+
+	// Validation
+	if (!gUsePubKeysFile && !gPubKey.x.IsZero())
+	{
 		if (!gStartSet || !gRange || !gDP)
 		{
 			printf("error: you must also specify -dp, -range and -start options\r\n");
 			return false;
 		}
+	}
+	if (gUsePubKeysFile)
+	{
+		if (!gRange || !gDP)
+		{
+			printf("error: with -pubkeysfile you must specify -dp and -range (start optional)\r\n");
+			return false;
+		}
+		if (!IsFileExist(gPubKeysFileName))
+		{
+			printf("error: cannot find file %s\r\n", gPubKeysFileName);
+			return false;
+		}
+	}
+
 	if (gTamesFileName[0] && !IsFileExist(gTamesFileName))
 	{
 		if (gMax == 0.0)
@@ -648,6 +663,8 @@ int main(int argc, char* argv[])
 	gRange = 0;
 	gStartSet = false;
 	gTamesFileName[0] = 0;
+	gPubKeysFileName[0] = 0;
+	gUsePubKeysFile = false;
 	gMax = 0.0;
 	gGenMode = false;
 	gIsOpsLimit = false;
@@ -668,123 +685,123 @@ int main(int argc, char* argv[])
 	TotalOps = 0;
 	TotalSolved = 0;
 	gTotalErrors = 0;
-	IsBench = gPubKey.x.IsZero();
+	IsBench = (gPubKey.x.IsZero() && !gUsePubKeysFile);
 
 	if (!IsBench && !gGenMode)
-{
-    printf("\r\nMAIN MODE\r\n\r\n");
+	{
+		printf("\r\nMAIN MODE\r\n\r\n");
 
-    if (gUsePubKeysFile)
-    {
-        FILE* f = fopen(gPubKeysFileName, "r");
-        if (!f) { printf("Cannot open %s\n", gPubKeysFileName); goto label_end; }
+		if (gUsePubKeysFile)
+		{
+			FILE* f = fopen(gPubKeysFileName, "r");
+			if (!f) { printf("Cannot open %s\n", gPubKeysFileName); goto label_end; }
 
-        char line[200];
-        int lineNum = 0;
-        while (fgets(line, sizeof(line), f))
-        {
-            lineNum++;
-            // Remove newline
-            line[strcspn(line, "\r\n")] = 0;
-            if (strlen(line) == 0) continue; // skip empty lines
+			char line[400];
+			int lineNum = 0;
+			while (fgets(line, sizeof(line), f))
+			{
+				lineNum++;
+				// Remove newline
+				line[strcspn(line, "\r\n")] = 0;
+				if (strlen(line) == 0) continue; // skip empty lines
 
-            EcPoint PntToSolve, PntOfs;
-            EcInt pk_found;
+				EcPoint PntToSolve, PntOfs;
+				EcInt pk_found;
 
-            if (!gPubKey.SetHexStr(line))
-            {
-                printf("Line %d: invalid pubkey format\n", lineNum);
-                continue;
-            }
+				if (!gPubKey.SetHexStr(line))
+				{
+					printf("Line %d: invalid pubkey format\n", lineNum);
+					continue;
+				}
 
-            PntToSolve = gPubKey;
-            if (!gStart.IsZero())
-            {
-                PntOfs = ec.MultiplyG(gStart);
-                PntOfs.y.NegModP();
-                PntToSolve = ec.AddPoints(PntToSolve, PntOfs);
-            }
+				PntToSolve = gPubKey;
+				if (!gStart.IsZero())
+				{
+					PntOfs = ec.MultiplyG(gStart);
+					PntOfs.y.NegModP();
+					PntToSolve = ec.AddPoints(PntToSolve, PntOfs);
+				}
 
-            char sx[100], sy[100];
-            gPubKey.x.GetHexStr(sx);
-            gPubKey.y.GetHexStr(sy);
-            printf("\n[Key %d] X: %s\nY: %s\n", lineNum, sx, sy);
+				char sx[100], sy[100];
+				gPubKey.x.GetHexStr(sx);
+				gPubKey.y.GetHexStr(sy);
+				printf("\n[Key %d] X: %s\nY: %s\n", lineNum, sx, sy);
 
-            if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
-            {
-                if (!gIsOpsLimit)
-                    printf("SolvePoint failed for line %d\n", lineNum);
-                continue;
-            }
+				if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
+				{
+					if (!gIsOpsLimit)
+						printf("SolvePoint failed for line %d\n", lineNum);
+					continue;
+				}
 
-            pk_found.AddModP(gStart);
-            EcPoint tmp = ec.MultiplyG(pk_found);
-            if (!tmp.IsEqual(gPubKey))
-            {
-                printf("ERROR: Wrong key for line %d\n", lineNum);
-                continue;
-            }
+				pk_found.AddModP(gStart);
+				EcPoint tmp = ec.MultiplyG(pk_found);
+				if (!tmp.IsEqual(gPubKey))
+				{
+					printf("ERROR: Wrong key for line %d\n", lineNum);
+					continue;
+				}
 
-            char s[100];
-            pk_found.GetHexStr(s);
-            printf("PRIVATE KEY: %s\n", s);
+				char s[100];
+				pk_found.GetHexStr(s);
+				printf("PRIVATE KEY: %s\n", s);
 
-            FILE* fp = fopen("RESULTS.TXT", "a");
-            if (fp) { fprintf(fp, "PRIVATE KEY: %s\n", s); fclose(fp); }
-            else    { printf("WARNING: Cannot save key to RESULTS.TXT\n"); }
-        }
-        fclose(f);
-    }
-    else
-    {
-        // Original single-key code (unchanged)
-        EcPoint PntToSolve, PntOfs;
-        EcInt pk, pk_found;
+				FILE* fp = fopen("RESULTS.TXT", "a");
+				if (fp) { fprintf(fp, "PRIVATE KEY: %s\n", s); fclose(fp); }
+				else    { printf("WARNING: Cannot save key to RESULTS.TXT\n"); }
+			}
+			fclose(f);
+		}
+		else
+		{
+			// Original single-key code (unchanged)
+			EcPoint PntToSolve, PntOfs;
+			EcInt pk, pk_found;
 
-        PntToSolve = gPubKey;
-        if (!gStart.IsZero())
-        {
-            PntOfs = ec.MultiplyG(gStart);
-            PntOfs.y.NegModP();
-            PntToSolve = ec.AddPoints(PntToSolve, PntOfs);
-        }
+			PntToSolve = gPubKey;
+			if (!gStart.IsZero())
+			{
+				PntOfs = ec.MultiplyG(gStart);
+				PntOfs.y.NegModP();
+				PntToSolve = ec.AddPoints(PntToSolve, PntOfs);
+			}
 
-        char sx[100], sy[100];
-        gPubKey.x.GetHexStr(sx);
-        gPubKey.y.GetHexStr(sy);
-        printf("Solving public key\r\nX: %s\r\nY: %s\r\n", sx, sy);
-        gStart.GetHexStr(sx);
-        printf("Offset: %s\r\n", sx);
+			char sx[100], sy[100];
+			gPubKey.x.GetHexStr(sx);
+			gPubKey.y.GetHexStr(sy);
+			printf("Solving public key\r\nX: %s\r\nY: %s\r\n", sx, sy);
+			gStart.GetHexStr(sx);
+			printf("Offset: %s\r\n", sx);
 
-        if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
-        {
-            if (!gIsOpsLimit)
-                printf("FATAL ERROR: SolvePoint failed\r\n");
-            goto label_end;
-        }
-        pk_found.AddModP(gStart);
-        EcPoint tmp = ec.MultiplyG(pk_found);
-        if (!tmp.IsEqual(gPubKey))
-        {
-            printf("FATAL ERROR: SolvePoint found incorrect key\r\n");
-            goto label_end;
-        }
-        char s[100];
-        pk_found.GetHexStr(s);
-        printf("\r\nPRIVATE KEY: %s\r\n\r\n", s);
-        FILE* fp = fopen("RESULTS.TXT", "a");
-        if (fp)
-        {
-            fprintf(fp, "PRIVATE KEY: %s\n", s);
-            fclose(fp);
-        }
-        else
-        {
-            printf("WARNING: Cannot save the key to RESULTS.TXT!\r\n");
-            while (1)
-                Sleep(100);
-        }
-    }
+			if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
+			{
+				if (!gIsOpsLimit)
+					printf("FATAL ERROR: SolvePoint failed\r\n");
+				goto label_end;
+			}
+			pk_found.AddModP(gStart);
+			EcPoint tmp = ec.MultiplyG(pk_found);
+			if (!tmp.IsEqual(gPubKey))
+			{
+				printf("FATAL ERROR: SolvePoint found incorrect key\r\n");
+				goto label_end;
+			}
+			char s[100];
+			pk_found.GetHexStr(s);
+			printf("\r\nPRIVATE KEY: %s\r\n\r\n", s);
+			FILE* fp = fopen("RESULTS.TXT", "a");
+			if (fp)
+			{
+				fprintf(fp, "PRIVATE KEY: %s\n", s);
+				fclose(fp);
+			}
+			else
+			{
+				printf("WARNING: Cannot save the key to RESULTS.TXT!\r\n");
+				while (1)
+					Sleep(100);
+			}
+		}
 
 	}
 	
@@ -835,6 +852,3 @@ label_end:
 	free(pPntList2);
 	free(pPntList);
 }
-
-
-
