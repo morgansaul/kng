@@ -570,6 +570,14 @@ bool ParseCommandLine(int argc, char* argv[])
 			}
 			ci++;
 		}
+			else
+if (strcmp(argument, "-pubkeysfile") == 0)
+{
+    strcpy(gPubKeysFileName, argv[ci]);
+    ci++;
+    gUsePubKeysFile = true;
+}
+
 		else
 		if (strcmp(argument, "-tames") == 0)
 		{
@@ -827,5 +835,6 @@ label_end:
 	free(pPntList2);
 	free(pPntList);
 }
+
 
 
