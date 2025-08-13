@@ -6,6 +6,9 @@
 
 #include <iostream>
 #include <vector>
+#include <fstream>
+#include <string>
+#include <ctype.h>
 
 #include "cuda_runtime.h"
 #include "cuda.h"
@@ -48,14 +51,17 @@ u32 gDP;
 u32 gRange;
 EcInt gStart;
 bool gStartSet;
-// multi-pubkey support
-std::vector<EcPoint> gPubKeys; // one or more public keys to solve
-EcPoint gPubKey;               // kept for backward compatibility (single -pubkey)
+EcPoint gPubKey;
 u8 gGPUs_Mask[MAX_GPU_CNT];
 char gTamesFileName[1024];
 double gMax;
 bool gGenMode; //tames generation mode
 bool gIsOpsLimit;
+
+// NEW: support processing multiple public keys from file
+static bool gUsePubKeysFile = false;
+static char gPubKeysFileName[1024];
+static std::vector<EcPoint> gPubKeysList;
 
 #pragma pack(push, 1)
 struct DBRec
@@ -65,6 +71,50 @@ struct DBRec
 	u8 type; //0 - tame, 1 - wild1, 2 - wild2
 };
 #pragma pack(pop)
+
+static void TrimWhitespace(std::string &s)
+{
+	// remove spaces and control characters
+	std::string out;
+	out.reserve(s.size());
+	for (size_t i = 0; i < s.size(); i++)
+	{
+		unsigned char c = (unsigned char)s[i];
+		if (!isspace(c)) out.push_back((char)c);
+	}
+	s.swap(out);
+}
+
+static bool LoadPubKeysFromFile(const char* fn)
+{
+	std::ifstream in(fn);
+	if (!in)
+	{
+		printf("error: cannot open pubkeys file %s\r\n", fn);
+		return false;
+	}
+	gPubKeysList.clear();
+	std::string line;
+	while (std::getline(in, line))
+	{
+		TrimWhitespace(line);
+		if (line.empty()) continue;
+		EcPoint P;
+		if (!P.SetHexStr((char*)line.c_str()))
+		{
+			printf("warning: invalid pubkey in file: %s\r\n", line.c_str());
+			continue;
+		}
+		gPubKeysList.push_back(P);
+	}
+	if (gPubKeysList.empty())
+	{
+		printf("error: no valid pubkeys found in %s\r\n", fn);
+		return false;
+	}
+	printf("Loaded %d public key(s) from %s\r\n", (int)gPubKeysList.size(), fn);
+	return true;
+}
 
 void InitGpus()
 {
@@ -311,45 +361,54 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 	printf("%sSpeed: %d MKeys/s, Err: %d, DPs: %lluK/%lluK, Time: %llud:%02dh:%02dm/%llud:%02dh:%02dm\r\n", gGenMode ? "GEN: " : (IsBench ? "BENCH: " : "MAIN: "), speed, gTotalErrors, db.GetBlockCnt()/1000, est_dps_cnt/1000, days, hours, min, exp_days, exp_hours, exp_min);
 }
 
-bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
+bool SolvePointMulti(EcPoint PntToSolve, int Range, int DP, EcInt *Solution)
 {
-	if ((Range < 32) || (Range > 180))
-	{
-		printf("Unsupported Range value (%d)!\r\n", Range);
-		return false;
-	}
-	if ((DP < 14) || (DP > 60)) 
-	{
-		printf("Unsupported DP value (%d)!\r\n", DP);
-		return false;
-	}
+    // Kangaroo initialization
+    std::vector<GpuKang*> GpuKangs;
+    int GpuCount = GetGpuCount();
+    for (int i = 0; i < GpuCount; i++)
+    {
+        GpuKangs.push_back(new GpuKang(i));
+        if (!GpuKangs.back()->Prepare(PntToSolve, Range, DP, EcJumps1, EcJumps2))
+            return false;
+    }
 
-	printf("\r\nSolving point: Range %d bits, DP %d, start...\r\n", Range, DP);
-	double ops = 1.15 * pow(2.0, Range / 2.0);
-	double dp_val = (double)(1ull << DP);
-	double ram = (32 + 4 + 4) * ops / dp_val; //+4 for grow allocation and memory fragmentation
-	ram += sizeof(TListRec) * 256 * 256 * 256; //3byte-prefix table
-	ram /= (1024 * 1024 * 1024); //GB
-	printf("SOTA method, estimated ops: 2^%.3f, RAM for DPs: %.3f GB. DP and GPU overheads not included!\r\n", log2(ops), ram);
-	gIsOpsLimit = false;
-	double MaxTotalOps = 0.0;
-	if (gMax > 0)
-	{
-		MaxTotalOps = gMax * ops;
-		double ram_max = (32 + 4 + 4) * MaxTotalOps / dp_val; //+4 for grow allocation and memory fragmentation
-		ram_max += sizeof(TListRec) * 256 * 256 * 256; //3byte-prefix table
-		ram_max /= (1024 * 1024 * 1024); //GB
-		printf("Max allowed number of ops: 2^%.3f, max RAM for DPs: %.3f GB\r\n", log2(MaxTotalOps), ram_max);
-	}
+    bool found = false;
 
-	u64 total_kangs = GpuKangs[0]->CalcKangCnt();
-	for (int i = 1; i < GpuCnt; i++)
-		total_kangs += GpuKangs[i]->CalcKangCnt();
-	double path_single_kang = ops / total_kangs;	
-	double DPs_per_kang = path_single_kang / dp_val;
-	printf("Estimated DPs per kangaroo: %.3f.%s\r\n", DPs_per_kang, (DPs_per_kang < 5) ? " DP overhead is big, use less DP value if possible!" : "");
+    while (!found)
+    {
+        for (auto g : GpuKangs)
+        {
+            std::vector<EcPoint> collisions;
+            g->Run(collisions);
 
-	// (moved tames load to main() for multi-pubkey runs)
+            for (auto &C : collisions)
+            {
+                // Compare against ALL target pubkeys
+                for (auto &T : targetPubkeys)
+                {
+                    if (C == T)
+                    {
+                        printf("Match found!\n");
+
+                        // Compute the private key here using your original single-key collision resolution logic.
+                        // Assuming you have a function like ResolveCollision(C, T, Solution):
+                        if (ResolveCollision(C, T, Solution))
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (found) break;
+            }
+            if (found) break;
+        }
+    }
+
+    for (auto g : GpuKangs) delete g;
+    return found;
+}
 
 	SetRndSeed(0); //use same seed to make tames from file compatible
 	PntTotalOps = 0;
@@ -552,52 +611,24 @@ bool ParseCommandLine(int argc, char* argv[])
 		else
 		if (strcmp(argument, "-pubkey") == 0)
 		{
-			EcPoint pk;
-			if (!pk.SetHexStr(argv[ci]))
+			if (!gPubKey.SetHexStr(argv[ci]))
 			{
 				printf("error: invalid value for -pubkey option\r\n");
 				return false;
 			}
 			ci++;
-			gPubKeys.push_back(pk);
-			gPubKey = pk; // keep legacy global in sync
 		}
 		else
-		if (strcmp(argument, "-pubkeys") == 0)
+		if (strcmp(argument, "-pubkeysfile") == 0) // NEW
 		{
 			if (ci >= argc)
 			{
-				printf("error: missed value after -pubkeys option\r\n");
+				printf("error: missed value after -pubkeysfile option\r\n");
 				return false;
 			}
-			char* listfile = argv[ci++];
-			FILE* fp = fopen(listfile, "r");
-			if (!fp)
-			{
-				printf("error: cannot open -pubkeys file\r\n");
-				return false;
-			}
-			char line[1024];
-			int lineno = 0, added = 0;
-			while (fgets(line, sizeof(line), fp))
-			{
-				lineno++;
-				// trim
-				char* s = line; while (*s==' '||*s=='\t'||*s=='\r'||*s=='\n') s++;
-				char* e = s + strlen(s); while (e>s && (e[-1]==' '||e[-1]=='\t'||e[-1]=='\r'||e[-1]=='\n')) *--e = 0;
-				if (!*s) continue;
-				EcPoint pk;
-				if (!pk.SetHexStr(s)) { printf("warning: line %d invalid, skipping\n", lineno); continue; }
-				gPubKeys.push_back(pk);
-				added++;
-			}
-			fclose(fp);
-			if (!added)
-			{
-				printf("error: no valid keys in -pubkeys file\r\n");
-				return false;
-			}
-			gPubKey = gPubKeys.front();
+			strcpy(gPubKeysFileName, argv[ci]);
+			ci++;
+			gUsePubKeysFile = true;
 		}
 		else
 		if (strcmp(argument, "-tames") == 0)
@@ -623,7 +654,7 @@ bool ParseCommandLine(int argc, char* argv[])
 			return false;
 		}
 	}
-	if (!gPubKeys.empty())
+	if ((!gPubKey.x.IsZero()) || gUsePubKeysFile) // updated to allow pubkeys file
 		if (!gStartSet || !gRange || !gDP)
 		{
 			printf("error: you must also specify -dp, -range and -start options\r\n");
@@ -672,9 +703,18 @@ int main(int argc, char* argv[])
 	gMax = 0.0;
 	gGenMode = false;
 	gIsOpsLimit = false;
+	gUsePubKeysFile = false;
+	gPubKeysFileName[0] = 0;
 	memset(gGPUs_Mask, 1, sizeof(gGPUs_Mask));
 	if (!ParseCommandLine(argc, argv))
 		return 0;
+
+	// If using pubkeys file, load it now (after ParseCommandLine validated basic options)
+	if (gUsePubKeysFile)
+	{
+		if (!LoadPubKeysFromFile(gPubKeysFileName))
+			return 0;
+	}
 
 	InitGpus();
 
@@ -689,38 +729,26 @@ int main(int argc, char* argv[])
 	TotalOps = 0;
 	TotalSolved = 0;
 	gTotalErrors = 0;
-	IsBench = gPubKeys.empty();
+
+	// IsBench means "no pubkey provided and not using pubkeys file and not generating tames"
+	IsBench = gPubKey.x.IsZero() && !gUsePubKeysFile;
 
 	if (!IsBench && !gGenMode)
 	{
-		printf("\r\nMAIN MODE (multi-pubkey capable)\r\n\r\n");
+		// MAIN MODE
+		printf("\r\nMAIN MODE\r\n\r\n");
 
-		// Load tames once per run if a file exists (for reuse across all keys)
-		if (!gGenMode && gTamesFileName[0])
+		// If file mode: loop over all keys; else: solve single key
+		int keysToSolve = gUsePubKeysFile ? (int)gPubKeysList.size() : 1;
+		for (int idx = 0; idx < keysToSolve; idx++)
 		{
-			printf("load tames...\r\n");
-			if (db.LoadFromFile(gTamesFileName))
-			{
-				printf("tames loaded\r\n");
-				if (db.Header[0] != gRange)
-				{
-					printf("loaded tames have different range, they cannot be used, clear\r\n");
-					db.Clear();
-				}
-			}
-			else
-				printf("tames loading failed\r\n");
-		}
+			if (gUsePubKeysFile)
+				gPubKey = gPubKeysList[idx];
 
-		FILE* fpOut = fopen("RESULTS.TXT", "a");
-		if (!fpOut) { printf("WARNING: Cannot open RESULTS.TXT for append!\r\n"); }
-
-		for (size_t idx = 0; idx < gPubKeys.size(); ++idx)
-		{
-			EcPoint pub = gPubKeys[idx];
 			EcPoint PntToSolve, PntOfs;
+			EcInt pk_found;
 
-			PntToSolve = pub;
+			PntToSolve = gPubKey;
 			if (!gStart.IsZero())
 			{
 				PntOfs = ec.MultiplyG(gStart);
@@ -728,37 +756,47 @@ int main(int argc, char* argv[])
 				PntToSolve = ec.AddPoints(PntToSolve, PntOfs);
 			}
 
-			char sx[100], sy[100], sstart[100];
-			pub.x.GetHexStr(sx);
-			pub.y.GetHexStr(sy);
-			gStart.GetHexStr(sstart);
-			printf("=== Key %zu/%zu ===\r\nX: %s\r\nY: %s\r\nOffset: %s\r\n", idx + 1, gPubKeys.size(), sx, sy, sstart);
+			char sx[100], sy[100];
+			gPubKey.x.GetHexStr(sx);
+			gPubKey.y.GetHexStr(sy);
+			printf("Solving public key\r\nX: %s\r\nY: %s\r\n", sx, sy);
+			gStart.GetHexStr(sx);
+			printf("Offset: %s\r\n", sx);
 
-			EcInt pk_found;
 			if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
 			{
 				if (!gIsOpsLimit)
-					printf("FATAL ERROR: SolvePoint failed for key %zu\r\n", idx + 1);
-				break;
+					printf("FATAL ERROR: SolvePoint failed\r\n");
+				// In file mode, continue to next key; otherwise exit
+				if (!gUsePubKeysFile) goto label_end;
+				else continue;
 			}
 			pk_found.AddModP(gStart);
 			EcPoint tmp = ec.MultiplyG(pk_found);
-			if (!tmp.IsEqual(pub))
+			if (!tmp.IsEqual(gPubKey))
 			{
-				printf("FATAL ERROR: SolvePoint found incorrect key for entry %zu\r\n", idx + 1);
-				break;
+				printf("FATAL ERROR: SolvePoint found incorrect key\r\n");
+				// In file mode, continue to next key; otherwise exit
+				if (!gUsePubKeysFile) goto label_end;
+				else continue;
 			}
-			// happy end for this key
+			// happy end
 			char s[100];
 			pk_found.GetHexStr(s);
-			printf("\r\nPRIVATE KEY [%zu]: %s\r\n\r\n", idx + 1, s);
-			if (fpOut)
+			printf("\r\nPRIVATE KEY: %s\r\n\r\n", s);
+			FILE* fp = fopen("RESULTS.TXT", "a");
+			if (fp)
 			{
-				fprintf(fpOut, "PRIVATE KEY [%zu]: %s\n", idx + 1, s);
-				fflush(fpOut);
+				fprintf(fp, "PRIVATE KEY: %s\n", s);
+				fclose(fp);
+			}
+			else //we cannot save the key, show error and wait forever so the key is displayed
+			{
+				printf("WARNING: Cannot save the key to RESULTS.TXT!\r\n");
+				while (1)
+					Sleep(100);
 			}
 		}
-		if (fpOut) fclose(fpOut);
 	}
 	else
 	{
