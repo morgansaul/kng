@@ -61,37 +61,76 @@ typedef char i8;
 
 #define DP_FLAG				0x8000
 #define INV_FLAG			0x4000
-#define JMP2_FLAG			0x2000
 
-#define MD_LEN				10
-
-//#define DEBUG_MODE
-
-//gpu kernel parameters
-struct TKparams
+// Structure to hold kernel parameters
+// This will be passed from the host to the device
+typedef struct 
 {
+	// Pointers to GPU global memory
 	u64* Kangs;
-	u32 KangCnt;
+	u64* Points;
+	u64* HostPoints;
+	u64* Distances;
+	
+	// Elliptic curve parameters
+	u64* Gx;
+	u64* Gy;
+	u64* P;
+	u64* N;
+	u64* A;
+	u64* B;
+	u64* R2P; // R^2 mod P
+	u64* InvN; // -N^-1 mod 2^64
+	u64* R2N; // R^2 mod N
+	u64* Inv256; // 256^-1 mod N
+
+	// Host-side collision detection pointers
+	u64* HostKangs;
+	u64* HostDistances;
+
+	u32 PointsPerKang;
+	u32 KangCount;
+	u32 BlockCount;
+	u32 ThreadCount;
+	u32 KPerBlock;
+	u32 Iteration;
+
+	u64 StartPoint[4];
+	u64 StopPoint[4];
+
+	// New fields for multiple public keys
+	u64* Pubkeys;       // Pointer to the array of public keys on the device
+	u32  PubkeyCount;   // The number of public keys
+	u64* CollisionResults; // Stores the index and position of found keys
+
+	// Existing kernel parameters
 	u32 BlockCnt;
 	u32 BlockSize;
-	u32 GroupCnt;
-	u64* L2;
-	u64 DP;
-	u32* DPs_out;
-	u64* Jumps1; //x(32b), y(32b), d(32b)
-	u64* Jumps2; //x(32b), y(32b), d(32b)
-	u64* Jumps3; //x(32b), y(32b), d(32b)
-	u64* JumpsList; //list of all performed jumps, grouped by warp(32) every 8 groups (from PNT_GROUP_CNT). Each jump is 2 bytes: 10bit jump index + flags: INV_FLAG, DP_FLAG, JMP2_FLAG
-	u32* DPTable;
-	u32* L1S2;
-	u64* LastPnts;
-	u64* LoopTable;
-	u32* dbg_buf;
-	u32* LoopedKangs;
-	bool IsGenMode; //tames generation mode
-
 	u32 KernelA_LDS_Size;
 	u32 KernelB_LDS_Size;
-	u32 KernelC_LDS_Size;	
-};
+	u32 KernelC_LDS_Size;
 
+} TKparams;
+
+// Point and curve parameters
+#define POINT_SIZE_BITS 256
+#define POINT_SIZE_BYTES 32
+#define POINT_SIZE_U64S 4
+#define POINT_DATA_SIZE 8 // 4 for X, 4 for Y
+#define POINT_SIZE_WORDS 8 // for 256-bit points
+#define POINT_SIZE_DOUBLE_WORDS 16 // for 512-bit intermediate
+#define POINTS_PER_THREAD 1
+#define STEP_CNT 1024
+
+// This is likely already defined in your code
+#define KANG_THREADS 1024
+#define KANG_BLOCKS 64
+#define KANG_GROUPS 16
+#define KANG_PER_GROUP 64
+
+// New collision result struct
+typedef struct
+{
+	u32 pubkeyIndex;
+	u64 privateKeyPart;
+} CollisionResult;
